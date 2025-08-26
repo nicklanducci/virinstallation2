@@ -2,137 +2,226 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>Vertical Live Text</title>
+  <title>Vertical Live Text • Smooth & Readable</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
-    @font-face {
-      font-family: "InstallationFace";
-      src: url("/fonts/YourFont.woff2") format("woff2");
-      font-display: swap;
-    }
+    html, body { height: 100%; margin: 0; background:#000; color:#fff; overflow:hidden; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
 
-    /* full-bleed black stage */
-    html, body { height: 100%; margin: 0; }
-    body {
-      background: #000; color: #fff;
-      font-family: "InstallationFace", system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-      overflow: hidden;  /* prevent scrollbars */
-    }
-
-    /* the “canvas” that holds the text column */
-    .stage {
-      position: fixed; inset: 0;
-      display: grid; place-items: center; /* center horizontally */
-    }
-
-    /* the vertical single-line text */
-    #out {
-      /* make it vertical and bottom-up */
-      writing-mode: vertical-rl;     /* vertical column */
-      text-orientation: mixed;       /* keep letters upright */
-      transform: rotate(180deg);     /* invert so it grows from bottom up */
-      transform-origin: center;      /* pivot nicely */
-      white-space: nowrap;           /* force a single “line” */
-      line-height: 1.05;             /* column density */
-      font-size: clamp(28px, 6vw, 120px);
-      max-height: 90vh;              /* keep it inside the screen */
+    .stage { position: fixed; inset: 0; display: grid; place-items: center; }
+    .viewport {
+      height: 90vh;
+      width: min(16vw, 220px);             /* slender column; adjust if needed */
       overflow: hidden;
-      text-align: center;            /* affects inline alignment in vertical mode */
+      display: flex; align-items: flex-end; justify-content: center;
+      position: relative;
     }
 
-    /* blinking block cursor at the bottom end */
-    .cursor::after {
-      content: "▌";
-      animation: blink 1s step-end infinite;
-      display: inline-block;
-      /* cursor flips with the text, no extra transform needed */
+    /* vertical single line (bottom-up via 180°) */
+    #line {
+      writing-mode: vertical-rl;
+      text-orientation: mixed;
+      white-space: nowrap;
+      line-height: 1.09;
+      font-size: clamp(28px, 6vw, 120px);
+      transform: rotate(180deg) translateY(0);
+      transform-origin: center;
+      will-change: transform;
+      user-select: none;
     }
+
+    /* inline cursor (always at end of visible text) */
+    #cursor {
+      display: inline-block;
+      width: 1ch; text-align: center;
+      animation: blink 1s step-end infinite;
+    }
+    #cursor::after { content: "▌"; }
     @keyframes blink { 50% { opacity: 0; } }
 
-    /* optional: simple control in the corner for testing */
+    /* optional minimal controls (bottom center) */
     .controls {
-      position: fixed; left: 1rem; right: 1rem; bottom: 1rem;
+      position: fixed; left: 0; right: 0; bottom: 10px;
       display: flex; gap: .5rem; justify-content: center;
-      font-size: 16px; pointer-events: auto;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
     }
     input, button {
-      background: #111; color: #fff; border: 1px solid #333;
-      padding: .6rem .8rem; border-radius: .5rem;
+      background:#111; color:#fff; border:1px solid #333; border-radius:.5rem;
+      padding:.6rem .8rem; font-size:16px;
     }
     button { cursor: pointer; }
   </style>
 </head>
 <body>
   <div class="stage">
-    <div id="out" class="cursor"></div>
+    <div class="viewport" id="viewport">
+      <!-- text first, cursor second so cursor is at the end -->
+      <div id="line"><span id="text"></span><span id="cursor"></span></div>
+    </div>
   </div>
 
-  <!-- optional: quick prompt UI for testing; remove for the art show -->
   <div class="controls">
     <input id="q" placeholder="Type a prompt…" size="40" />
     <button id="go">Stream</button>
   </div>
 
   <script>
-    const out = document.getElementById("out");
-    const q   = document.getElementById("q");
-    const go  = document.getElementById("go");
+    // ========= READABILITY TIMING (steady, slow) =========
+    const CHAR_MS   = 170;   // per-character base delay
+    const SPACE_MS  = 280;   // after spaces
+    const COMMA_MS  = 520;   // after , ;
+    const PERIOD_MS = 1000;  // after . ! ? …
+    const DASH_MS   = 650;   // after – — -
+    const REDUCED_MOTION = matchMedia("(prefers-reduced-motion: reduce)").matches;
 
-    // normalize to keep it one line (strip newlines to spaces)
-    const append = (text) => {
-      out.textContent += text.replace(/\s*\n+\s*/g, " ");
-    };
+    // ========= SCROLL (constant, very smooth) =========
+    const BOTTOM_ROOM_PX = 180;  // keep this space under the cursor
+    const LERP_BASE      = 0.06; // easing toward target (0..1), smaller = smoother/slower
+    const LERP_BOOST     = 0.10; // slightly faster easing if lag is notable
+    const LAG_THRESHOLD  = 36;   // switch to boost easing when |lag| > threshold
+
+    // ========= DOM =========
+    const viewport = document.getElementById("viewport");
+    const line     = document.getElementById("line");
+    const textSpan = document.getElementById("text");
+    const inputEl  = document.getElementById("q");
+    const goBtn    = document.getElementById("go");
+
+    // ========= STREAM BUFFER + PLAYER =========
+    // We buffer incoming deltas from SSE and play them out at our own pace.
+    let buffer = "";        // pending characters to display
+    let playing = false;    // player loop on/off
+    let es = null;          // EventSource handle
+
+    function delayFor(ch) {
+      if (ch === " ") return CHAR_MS + SPACE_MS;
+      if (/[,\u061B;]/.test(ch)) return CHAR_MS + COMMA_MS;
+      if (/[.!?]/.test(ch))      return CHAR_MS + PERIOD_MS;
+      if (/[\u2013\u2014-]/.test(ch)) return CHAR_MS + DASH_MS; // – — -
+      if (ch === "\u2026") return CHAR_MS + PERIOD_MS; // …
+      return CHAR_MS;
+    }
+
+    // Compute target translateY so we always leave room under the cursor
+    let targetY = 0, currentY = 0;
+    function computeTargetY() {
+      const contentH = line.scrollHeight;
+      const viewH    = viewport.clientHeight;
+      const allowedH = Math.max(0, viewH - BOTTOM_ROOM_PX);
+      const excess   = contentH - allowedH;
+      targetY = excess > 0 ? -excess : 0;
+    }
+    function applyTransform() {
+      line.style.transform = `rotate(180deg) translateY(${currentY}px)`;
+    }
+    function animateScroll() {
+      requestAnimationFrame(animateScroll);
+      if (REDUCED_MOTION) {
+        currentY = targetY; // snap for accessibility
+      } else {
+        const lag  = targetY - currentY;
+        const ease = Math.abs(lag) > LAG_THRESHOLD ? LERP_BOOST : LERP_BASE;
+        currentY  += lag * ease;
+      }
+      applyTransform();
+    }
+    animateScroll();
+
+    // Controlled typewriter that consumes our buffer
+    function playLoop() {
+      if (playing) return;
+      playing = true;
+
+      (function step() {
+        if (!buffer.length) { playing = false; return; }
+
+        // Take the next grapheme-ish char from buffer
+        const ch = buffer[0];
+        buffer = buffer.slice(1);
+
+        // Append, normalizing newlines to spaces to keep a single vertical “line”
+        textSpan.textContent += (ch === "\n") ? " " : ch;
+
+        // Keep bottom room & smooth scroll
+        computeTargetY();
+
+        setTimeout(step, delayFor(ch));
+      })();
+    }
 
     function startStream(prompt) {
-      out.textContent = "";
-      out.classList.add("cursor");
+      // Reset UI & state
+      textSpan.textContent = "";
+      buffer = "";
+      computeTargetY();
+      currentY = targetY;    // align at start
+      applyTransform();
 
-      const es = new EventSource(`/stream?prompt=${encodeURIComponent(prompt)}`);
+      // Close previous stream if any
+      if (es) { try { es.close(); } catch {} es = null; }
 
-      // OpenAI named events
+      // Open SSE to your Netlify edge function
+      es = new EventSource(`/stream?prompt=${encodeURIComponent(prompt)}`);
+
+      // OpenAI named event: streaming text chunks
       es.addEventListener("response.output_text.delta", (e) => {
         try {
           const msg = JSON.parse(e.data);
-          if (typeof msg.delta === "string") append(msg.delta);
+          if (typeof msg.delta === "string") {
+            buffer += msg.delta;
+            playLoop(); // ensure playback is running
+          }
         } catch {}
       });
 
+      // End of this response
       es.addEventListener("response.completed", () => {
+        // let the player finish remaining buffer; keep cursor blinking
         es.close();
-        out.classList.remove("cursor");
       });
 
-      // Fallback handler for generic messages and errors
+      // Fallback generic messages
       es.onmessage = (e) => {
-        if (e.data === "[DONE]") { es.close(); out.classList.remove("cursor"); return; }
+        if (e.data === "[DONE]") { es.close(); return; }
         try {
           const msg = JSON.parse(e.data);
-          if (typeof msg.delta === "string") append(msg.delta);
-          if (msg.error) append(`  [error] ${msg.error}`);
+          if (typeof msg.delta === "string") {
+            buffer += msg.delta;
+            playLoop();
+          }
+          if (msg.error) {
+            buffer += `  [error] ${msg.error}`;
+            playLoop();
+          }
         } catch {}
       };
 
       es.onerror = () => {
-        out.classList.remove("cursor");
-        append("  [stream error]");
-        es.close();
+        try { es.close(); } catch {}
+        // leave any existing text; do not interrupt reader
       };
     }
 
-    // boot with a default line; change or remove for your show
-    startStream("Give me a single haunting line about the wind.");
+    // ===== Default start + simple controls =====
+    const defaultPrompt = "Give me a single haunting line about the wind.";
+    startStream(defaultPrompt);
+    inputEl.value = defaultPrompt;
 
-    // test UI
-    if (go) {
-      go.addEventListener("click", () => {
-        const prompt = (q.value || "Say hello!").trim();
-        startStream(prompt);
-        q.blur();
-      });
-      q.addEventListener("keydown", (e) => {
-        if (e.key === "Enter") go.click();
-      });
-    }
+    goBtn.addEventListener("click", () => {
+      const p = (inputEl.value || "Say hello!").trim();
+      startStream(p);
+      inputEl.blur();
+    });
+    inputEl.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") goBtn.click();
+    });
+
+    // Keep layout stable on resize
+    addEventListener("resize", () => {
+      computeTargetY();
+      currentY = targetY;
+      applyTransform();
+    });
   </script>
 </body>
 </html>
